@@ -45,6 +45,16 @@ class RefundTests(unittest.TestCase):
                 route('session', 'C2', 'order status')
         workers[0].assert_not_called()
 
+    def test_runtime_uses_communication_when_router_skips_it(self):
+        agent = Mock(return_value='final answer')
+        with patch.object(module, '_read_workflow_state', return_value={'customer_id': 'C1', 'version': 0}), \
+             patch.object(module, '_update_workflow_state') as update, \
+             patch.object(module, 'build_communication_agent', return_value=agent), \
+             patch.object(module, '_apply_guardrail'):
+            result = module._ensure_communication('session', 'C1', 'request')
+        self.assertEqual(result, 'final answer')
+        update.assert_called_once_with('session', {'communication_agent': 'final answer'}, 0)
+
 
 if __name__ == '__main__':
     unittest.main()

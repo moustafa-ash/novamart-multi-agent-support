@@ -1219,6 +1219,22 @@ def run_invoke(message: str, customer_id: str = "CUST-001") -> None:
         print(f"X-Ray trace: {result['trace_id']}")
 
 
+def _ensure_communication(session_id: str, customer_id: str, request: str) -> str:
+    """Produce and store a final response if the router skipped communication."""
+    state = _read_workflow_state(session_id)
+    if not state:
+        state = _create_workflow_state(session_id, customer_id)
+    if state['customer_id'] != customer_id:
+        raise ValueError('Session customer does not match')
+    if state.get('communication_agent'):
+        return state['communication_agent']
+    agent = build_communication_agent()
+    _apply_guardrail([agent])
+    response = str(agent(f'Session ID: {session_id}. Customer ID: {customer_id}. Request: {request}'))
+    _update_workflow_state(session_id, {'communication_agent': response}, int(state['version']))
+    return response
+
+
 def run_serve() -> None:
     """
     HTTP entry point executed inside Amazon Bedrock AgentCore Runtime.
@@ -1265,10 +1281,11 @@ def run_serve() -> None:
 
         enriched = f"[Session ID: {session_id}] [Customer ID: {customer_id}] {prompt}"
         with tracer.trace_request(session_id, customer_id, prompt):
-            response = _orchestrator()(enriched)
+            _orchestrator()(enriched)
+            response = _ensure_communication(session_id, customer_id, prompt)
 
         state = _read_workflow_state(session_id) or {}
-        text  = _strip_xml_tags(state.get('communication_agent', '') or str(response))
+        text  = _strip_xml_tags(state.get('communication_agent', '') or response)
         flush_logs()
         return {'result': text, 'session_id': session_id, 'customer_id': customer_id,
                 'trace_id': tracer.last_trace_id}
