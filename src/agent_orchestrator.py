@@ -44,6 +44,7 @@ import sys
 import uuid
 import logging
 import threading
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
@@ -220,21 +221,40 @@ def build_inventory_agent() -> Agent:
     """Build an agent that retrieves synthetic order and customer facts."""
     @tool
     def check_order_status(customer_id: str, order_id: str) -> dict:
-        """Find one customer's order by both IDs and return its facts or not found."""
+        """Find one customer's order.
+
+        Args:
+            customer_id: Owner of the order.
+            order_id: Order to look up.
+        Returns:
+            Order facts or an order-not-found error.
+        """
         result = dynamodb.Table(config.ORDERS_TABLE).get_item(
             Key={'customer_id': customer_id, 'order_id': order_id}, ConsistentRead=True)
         return result.get('Item') or {'error': 'Order not found'}
 
     @tool
     def get_customer_tier(customer_id: str) -> dict:
-        """Get the account tier for the given customer ID, or report not found."""
+        """Get the customer's account tier.
+
+        Args:
+            customer_id: Customer to look up.
+        Returns:
+            Customer facts or a customer-not-found error.
+        """
         result = dynamodb.Table(config.CUSTOMERS_TABLE).get_item(
             Key={'customer_id': customer_id}, ConsistentRead=True)
         return result.get('Item') or {'error': 'Customer not found'}
 
     @tool
     def list_customer_orders(customer_id: str) -> dict:
-        """List all orders belonging to the given customer ID."""
+        """List orders belonging to one customer.
+
+        Args:
+            customer_id: Owner whose orders to list.
+        Returns:
+            An orders list, including an empty list when none exist.
+        """
         table = dynamodb.Table(config.ORDERS_TABLE)
         kwargs = {'KeyConditionExpression': Key('customer_id').eq(customer_id)}
         items = []
@@ -254,12 +274,26 @@ def build_refund_agent() -> Agent:
     """Build an agent that checks and initiates returns for synthetic orders."""
     @tool
     def get_inventory_context(session_id: str) -> dict:
-        """Read inventory findings from the specified workflow session."""
+        """Read inventory findings from workflow state.
+
+        Args:
+            session_id: Workflow session to read.
+        Returns:
+            Inventory findings or an empty mapping.
+        """
         return (_read_workflow_state(session_id) or {}).get('inventory_agent', {})
 
     @tool
     def initiate_refund(customer_id: str, order_id: str, reason: str) -> dict:
-        """Validate the customer's order and tier, then initiate one return if eligible."""
+        """Validate eligibility and initiate one requested return.
+
+        Args:
+            customer_id: Owner of the order.
+            order_id: Order to return.
+            reason: Customer's stated return reason.
+        Returns:
+            Return reference and status, or an eligibility error.
+        """
         from datetime import date
         table = dynamodb.Table(config.ORDERS_TABLE)
         key = {'customer_id': customer_id, 'order_id': order_id}
@@ -303,17 +337,35 @@ def build_policy_agent() -> Agent:
     """Build the parallel three-knowledge-base policy coordinator."""
     @tool
     def retrieve_returns_policy(query: str) -> str:
-        """Retrieve returns policy passages relevant to the query."""
+        """Retrieve sourced returns policy passages.
+
+        Args:
+            query: Customer's policy question.
+        Returns:
+            Formatted returns passages with sources.
+        """
         return format_kb_results(retrieve_from_knowledge_base(config.RETURNS_KB_ID, query))
 
     @tool
     def retrieve_shipping_policy(query: str) -> str:
-        """Retrieve shipping policy passages relevant to the query."""
+        """Retrieve sourced shipping policy passages.
+
+        Args:
+            query: Customer's policy question.
+        Returns:
+            Formatted shipping passages with sources.
+        """
         return format_kb_results(retrieve_from_knowledge_base(config.SHIPPING_KB_ID, query))
 
     @tool
     def retrieve_warranty_policy(query: str) -> str:
-        """Retrieve warranty policy passages relevant to the query."""
+        """Retrieve sourced warranty policy passages.
+
+        Args:
+            query: Customer's policy question.
+        Returns:
+            Formatted warranty passages with sources.
+        """
         return format_kb_results(retrieve_from_knowledge_base(config.WARRANTY_KB_ID, query))
 
     def retriever(name, retrieval_tool):
@@ -330,7 +382,13 @@ def build_policy_agent() -> Agent:
 
     @tool
     def search_all_policies(query: str) -> str:
-        """Query all policy retrievers concurrently and combine their sourced results."""
+        """Search the three policy knowledge bases concurrently.
+
+        Args:
+            query: Customer's policy question.
+        Returns:
+            Combined sourced passages labeled by policy domain.
+        """
         trace.kb_start({'Returns': config.RETURNS_KB_ID, 'Shipping': config.SHIPPING_KB_ID,
                         'Warranty': config.WARRANTY_KB_ID})
         results = {}
@@ -358,7 +416,13 @@ def build_communication_agent() -> Agent:
     """Build the customer-facing response agent."""
     @tool
     def get_full_workflow_context(session_id: str) -> dict:
-        """Return the accumulated findings for the given workflow session."""
+        """Read all accumulated workflow findings.
+
+        Args:
+            session_id: Workflow session to read.
+        Returns:
+            Current workflow state or an empty mapping.
+        """
         return _read_workflow_state(session_id) or {}
 
     return Agent(model=BedrockModel(model_id=config.WORKER_MODEL_ID, temperature=0.3),
@@ -368,6 +432,24 @@ def build_communication_agent() -> Agent:
                                 'is 149.95 times 0.90 = 134.955, which rounds to 134.96; '
                                 'do not round the intermediate discount.'),
                  tools=[get_full_workflow_context])
+
+
+def _required_routes(request: str) -> tuple[str, ...]:
+    """Choose required workers from the customer's original request.
+
+    Args:
+        request: Unmodified customer question.
+    Returns:
+        Worker state columns in the order they must run.
+    """
+    question = request.lower()
+    if re.search(r'\b(policy|policies|shipping|warranty|coverage|window|terms)\b', question) and not re.search(r'\border\s+[a-z0-9-]+\b', question):
+        return ('policy_agent',)
+    if re.search(r'\b(order|orders|return|returns|refund|refunded|delivery|delivered)\b', question):
+        return ('inventory_agent', 'refund_agent')
+    if re.search(r'\b(account|tier|premium|membership|profile)\b', question):
+        return ('inventory_agent',)
+    return ()
 
 
 def build_orchestrator_agent(inventory_agent: Agent, refund_agent: Agent,
@@ -388,38 +470,89 @@ def build_orchestrator_agent(inventory_agent: Agent, refund_agent: Agent,
 
     @tool
     def initialize_session(session_id: str, customer_id: str) -> str:
-        """Create the shared workflow state for this session and customer."""
+        """Create shared workflow state before routing.
+
+        Args:
+            session_id: New workflow session identifier.
+            customer_id: Customer to bind to this session.
+        Returns:
+            Session initialization confirmation.
+        """
         _create_workflow_state(session_id, customer_id)
         return 'Session initialized'
 
     @tool
     def route_to_inventory_agent(session_id: str, customer_id: str, request: str) -> str:
-        """Gather the specified customer's order or account facts for this session."""
+        """Gather order or account facts for the session.
+
+        Args:
+            session_id: Initialized workflow session.
+            customer_id: Customer bound to the session.
+            request: Original customer question.
+        Returns:
+            Inventory agent findings stored in workflow state.
+        """
         return run_worker(session_id, 'inventory_agent', inventory_agent,
                           f'Customer ID: {customer_id}. Request: {request}', customer_id)
 
     @tool
     def route_to_policy_agent(session_id: str, request: str) -> str:
-        """Retrieve policy facts for the session and original request."""
+        """Retrieve policy facts for the workflow.
+
+        Args:
+            session_id: Initialized workflow session.
+            request: Original customer question.
+        Returns:
+            Policy agent findings stored in workflow state.
+        """
         return run_worker(session_id, 'policy_agent', policy_agent, request)
 
     @tool
     def route_to_refund_agent(session_id: str, customer_id: str, request: str) -> str:
-        """Evaluate a requested return after inventory facts are gathered."""
+        """Evaluate return status or a requested return after inventory.
+
+        Args:
+            session_id: Initialized workflow session.
+            customer_id: Customer bound to the session.
+            request: Original customer question.
+        Returns:
+            Refund agent findings stored in workflow state.
+        """
         return run_worker(session_id, 'refund_agent', refund_agent,
                           f'Session ID: {session_id}. Customer ID: {customer_id}. Request: {request}', customer_id)
 
     @tool
     def route_to_communication_agent(session_id: str, customer_id: str, original_request: str) -> str:
-        """Compose the final response using all workflow findings and the original request."""
+        """Run any missing required workers, then compose the final response.
+
+        Args:
+            session_id: Workflow session whose state receives worker results.
+            customer_id: Customer bound to that session.
+            original_request: Customer's original unmodified question.
+        Returns:
+            Final customer-facing response, stored in workflow state.
+        """
+        state = _read_workflow_state(session_id)
+        if not state or state['customer_id'] != customer_id:
+            raise ValueError('Initialize the matching customer session first')
+        for column in _required_routes(original_request):
+            if not state.get(column):
+                if column == 'inventory_agent':
+                    route_to_inventory_agent(session_id, customer_id, original_request)
+                elif column == 'refund_agent':
+                    route_to_refund_agent(session_id, customer_id, original_request)
+                else:
+                    route_to_policy_agent(session_id, original_request)
+                state = _read_workflow_state(session_id)
         return run_worker(session_id, 'communication_agent', communication_agent,
                           f'Session ID: {session_id}. Customer ID: {customer_id}. Request: {original_request}', customer_id)
 
     return Agent(model=BedrockModel(model_id=config.ORCHESTRATOR_MODEL_ID, temperature=0.0),
         system_prompt=('You are a router, not a customer-facing assistant. You MUST call initialize_session '
                        'before any other tool, including for arithmetic. NEVER answer or calculate directly. '
-                       'For order status, history or account tier call inventory. '
-                       'For return requests call inventory then refund. For policy questions call policy. '
+                       'For order status, order history, return or refund, call inventory then refund; '
+                       'for a status question refund only evaluates and must never initiate a return. '
+                       'For policy questions call policy. For account questions call inventory only, never policy. '
                        'For arithmetic skip inventory, refund and policy, but call communication with the complete '
                        'original question. Always call communication last and return its response verbatim. '
                        'The request is not complete unless communication has been called. Use the supplied session '
@@ -1219,20 +1352,19 @@ def run_invoke(message: str, customer_id: str = "CUST-001") -> None:
         print(f"X-Ray trace: {result['trace_id']}")
 
 
-def _ensure_communication(session_id: str, customer_id: str, request: str) -> str:
-    """Produce and store a final response if the router skipped communication."""
+def _ensure_communication(orchestrator: Agent, session_id: str, customer_id: str, request: str) -> str:
+    """Finish through the router's communication tool if the model skipped it."""
     state = _read_workflow_state(session_id)
     if not state:
-        state = _create_workflow_state(session_id, customer_id)
+        initialize = orchestrator.tool_registry.registry['initialize_session']._tool_func
+        initialize(session_id, customer_id)
+        state = _read_workflow_state(session_id)
     if state['customer_id'] != customer_id:
         raise ValueError('Session customer does not match')
-    if state.get('communication_agent'):
+    if state.get('communication_agent') and all(state.get(column) for column in _required_routes(request)):
         return state['communication_agent']
-    agent = build_communication_agent()
-    _apply_guardrail([agent])
-    response = str(agent(f'Session ID: {session_id}. Customer ID: {customer_id}. Request: {request}'))
-    _update_workflow_state(session_id, {'communication_agent': response}, int(state['version']))
-    return response
+    route = orchestrator.tool_registry.registry['route_to_communication_agent']._tool_func
+    return route(session_id, customer_id, request)
 
 
 def run_serve() -> None:
@@ -1281,8 +1413,9 @@ def run_serve() -> None:
 
         enriched = f"[Session ID: {session_id}] [Customer ID: {customer_id}] {prompt}"
         with tracer.trace_request(session_id, customer_id, prompt):
-            _orchestrator()(enriched)
-            response = _ensure_communication(session_id, customer_id, prompt)
+            orchestrator = _orchestrator()
+            orchestrator(enriched)
+            response = _ensure_communication(orchestrator, session_id, customer_id, prompt)
 
         state = _read_workflow_state(session_id) or {}
         text  = _strip_xml_tags(state.get('communication_agent', '') or response)
