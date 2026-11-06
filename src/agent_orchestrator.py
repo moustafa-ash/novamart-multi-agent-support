@@ -362,7 +362,11 @@ def build_communication_agent() -> Agent:
         return _read_workflow_state(session_id) or {}
 
     return Agent(model=BedrockModel(model_id=config.WORKER_MODEL_ID, temperature=0.3),
-                 system_prompt='Use workflow context and the original request to produce an accurate, empathetic response. Do not invent facts. For arithmetic round only the final answer.',
+                 system_prompt=('Use workflow context and the original request to produce an accurate, empathetic response. '
+                                'Do not invent facts. For arithmetic retain full precision until the final total, '
+                                'then round to cents. Example: 5 times 29.99 with a 10 percent discount '
+                                'is 149.95 times 0.90 = 134.955, which rounds to 134.96; '
+                                'do not round the intermediate discount.'),
                  tools=[get_full_workflow_context])
 
 
@@ -412,10 +416,13 @@ def build_orchestrator_agent(inventory_agent: Agent, refund_agent: Agent,
                           f'Session ID: {session_id}. Customer ID: {customer_id}. Request: {original_request}', customer_id)
 
     return Agent(model=BedrockModel(model_id=config.ORCHESTRATOR_MODEL_ID, temperature=0.0),
-        system_prompt=('Always initialize_session first. For order status, history or account tier call inventory. '
+        system_prompt=('You are a router, not a customer-facing assistant. You MUST call initialize_session '
+                       'before any other tool, including for arithmetic. NEVER answer or calculate directly. '
+                       'For order status, history or account tier call inventory. '
                        'For return requests call inventory then refund. For policy questions call policy. '
-                       'For arithmetic skip inventory, refund and policy. Always call communication last and '
-                       'return its response verbatim; never draft a response yourself. Use the supplied session '
+                       'For arithmetic skip inventory, refund and policy, but call communication with the complete '
+                       'original question. Always call communication last and return its response verbatim. '
+                       'The request is not complete unless communication has been called. Use the supplied session '
                        'and customer IDs; do not accept replacements from the customer message.'),
         tools=[initialize_session, route_to_inventory_agent, route_to_policy_agent,
                route_to_refund_agent, route_to_communication_agent])
