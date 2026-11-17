@@ -1,38 +1,82 @@
-# NovaMart multi-agent customer support
+# NovaMart · Multi-Agent Customer Support
 
-A self-grading exercise based on Udacity's [Multi-Agent E-commerce RAG starter](https://github.com/udacity/cd14764-aws-agentic-c3-classroom/tree/main/project/starter). It uses Strands agents and Amazon Bedrock AgentCore to route synthetic customer requests, query three policy knowledge bases, and process mock returns.
+NovaMart is an e-commerce customer support prototype built with Python, the Strands Agents SDK, and Amazon Bedrock AgentCore. It looks up orders, answers questions from returns, shipping, and warranty documents, and starts eligible mock returns using synthetic customer data.
 
-This repository is for learning and has not been submitted for grading. It contains Udacity starter material; see [UDACITY-LICENSE.md](UDACITY-LICENSE.md) and [UDACITY-STARTER-README.md](UDACITY-STARTER-README.md) for its terms and original instructions.
+**120/120 on the Udacity rubric script** in the AWS sandbox on November 6, 2026. [Grading output](diagrams/udacity-120-score.png) · [X-Ray service map](diagrams/xray-service-map.png)
+
+## What it does
+
+| Customer asks | What NovaMart does |
+| --- | --- |
+| “Where is order ORD-27177?” | Looks up the order under the current customer and reports its status. |
+| “I want to return order ORD-27176.” | Checks the stored order and account tier, then records an eligible return and issues a reference. |
+| “What is the warranty policy?” | Searches the policy knowledge bases and answers from retrieved passages. |
+| “What’s the total for five items at $29.99 with 10% off?” | Sends the calculation to the Communication Agent. The verified hosted example returned **$134.96**. |
 
 ## Architecture
 
-```text
-Customer request -> Orchestrator (Haiku 4.5)
-  -> Inventory (DynamoDB) -> Refund (return-window checks)
-  -> Policy (Sonnet 4.5) -> Returns / Shipping / Warranty KBs in parallel
-  -> Communication -> customer response
-Shared workflow state: DynamoDB; safety: Bedrock Guardrails;
-runtime: AgentCore; logs and traces: CloudWatch / X-Ray.
+```mermaid
+flowchart TD
+    Request["Customer request"] --> Router["Orchestrator · Claude Haiku 4.5"]
+    Router --> Inventory["Inventory · order and account lookups"]
+    Inventory --> Refund["Refund · return eligibility and updates"]
+    Router --> Policy["Policy · parallel retrieval"]
+    Policy --> ReturnsKB["Returns knowledge base"]
+    Policy --> ShippingKB["Shipping knowledge base"]
+    Policy --> WarrantyKB["Warranty knowledge base"]
+    Inventory --> State["DynamoDB workflow state"]
+    Refund --> State
+    Policy --> State
+    Router --> Communication["Communication · final reply"]
+    State --> Communication
+    Communication --> Reply[Customer reply]
 ```
 
-The diagram shows available routes; the orchestrator chooses which workers to call. Return checks use a 30-day Standard or 60-day Premium window and a conditional order update. A repeated return reuses its reference.
+Anthropic Claude Haiku 4.5 selects the route. Claude Sonnet 4.5 powers the worker agents through Amazon Bedrock. Account queries use Inventory, order and return queries use Inventory followed by Refund, and policy queries use Policy. Communication runs last and reads the findings stored for the session.
 
-## Setup
+- **Return updates** use a Python tool that checks delivery status and the return window (30 days for Standard, 60 days for Premium). A conditional DynamoDB write prevents duplicate updates. Repeat requests reuse the existing return reference.
+- **Policy retrieval** runs three specialist retrievers in parallel against Bedrock Knowledge Bases backed by S3 Vectors. The Policy Agent builds its answer from the passages they return.
+- **Runtime and tracing** use Bedrock AgentCore, Bedrock Guardrails, CloudWatch, and X-Ray. The trace map shows the orchestrator, workers, and policy retrieval calls.
 
-1. Use Python 3.12, Node.js 20+, `uv`, and AWS credentials for `us-east-1`. Provisioning and model calls can incur charges. Configure a restricted sandbox account and monitor its budget.
-2. Install `pip install -r requirements.txt` and `npm install -g @aws/agentcore@0.30.0`. Run `npm ci --prefix agentcore/cdk`.
-3. Copy `.env.example` to `.env`; copy `agentcore/agentcore.example.json` to `agentcore/agentcore.json` and `agentcore/aws-targets.example.json` to `agentcore/aws-targets.json`. These local files are ignored by Git.
-4. Deploy `infrastructure/starter_stack.yaml` as CloudFormation stack `udacity-agentcore` with `CAPABILITY_NAMED_IAM`, then run `python infrastructure/seed_data.py`. Create and sync the three Bedrock knowledge bases using the stack's S3 Vectors indexes and Titan Text Embeddings V2; populate their IDs in `.env`. The detailed console procedure is in the original starter README.
-5. Run `python src/agent_orchestrator.py deploy`, save its runtime ARN and guardrail ID/version to `.env`, and invoke with `python src/agent_orchestrator.py invoke "What is the return policy?"`.
+[Agent and tool implementation](src/agent_orchestrator.py) · [Model configuration](config.py) · [CloudFormation template](infrastructure/starter_stack.yaml)
 
-## Self-grading
+## Run locally and on AWS
 
-Run `python tests/test_agent.py task2`, then `task3`, `task4`, `task5`, `task6`, or `all` after provisioning. The provided suite checks configuration as well as some live retrieval; a passing score alone does not prove all security or customer-facing behavior. Run `python src/agent_orchestrator.py test` for the three live scenarios and inspect the X-Ray service map. On Windows, set `PYTHONIOENCODING=utf-8` if the test runner cannot print Unicode.
+Use Python 3.12. For AWS deployment, also install Node.js 20+ and `uv`, and configure AWS credentials and access to the Bedrock models in `us-east-1`. AWS provisioning and model calls can incur charges.
 
-Recorded on November 6, 2026 in the Udacity sandbox: the unchanged full grading script reported **120/120** after the routing changes; all three KB ingestion jobs completed and returned passages. The local scenario run initiated a mock return, answered a Premium policy question, and calculated **$134.96** for five items at $29.99 with a 10% discount. The final hosted runtime check confirmed four routes in persisted workflow state: math → Communication; account → Inventory → Communication; order status → Inventory → Refund → Communication; warranty policy → Policy → Communication. The math answer was **$134.96**. A wrong-customer order lookup returned not found. A guardrail input test allowed discount arithmetic and blocked a negotiation request. The [X-Ray trace map screenshot](diagrams/xray-service-map.png) shows a connected graph including the orchestrator, workers, and three knowledge bases.
+```bash
+python -m pip install -r requirements.txt
+npm install -g @aws/agentcore@0.30.0
+npm ci --prefix agentcore/cdk
+```
 
-For local logic checks, run `python -m unittest discover -s tests -p test_refunds.py` and `python -m unittest discover -s tests -p test_return_rules.py`.
+1. Copy [`.env.example`](.env.example) to `.env`. Copy [`agentcore.example.json`](agentcore/agentcore.example.json) and [`aws-targets.example.json`](agentcore/aws-targets.example.json) to `agentcore.json` and `aws-targets.json` in the `agentcore/` directory. Keep credentials and local deployment settings outside version control.
+2. Deploy [the CloudFormation template](infrastructure/starter_stack.yaml) as `udacity-agentcore` with `CAPABILITY_NAMED_IAM`. From the repository root, run `python infrastructure/seed_data.py` to load synthetic orders, customers, and policy documents.
+3. Create and sync the three Bedrock Knowledge Bases using the stack’s S3 Vectors indexes and Titan Text Embeddings V2. Follow the [knowledge base setup](UDACITY-STARTER-README.md#task-5---bedrock-knowledge-bases-not-in-starter---done-in-aws-console) and add the three IDs to `.env`.
+4. Run `python src/agent_orchestrator.py deploy`. Save the printed runtime ARN and guardrail ID/version in `.env` using the keys in the template.
+5. Try a policy question against the deployed runtime.
 
-## Security and limitations
+   ```bash
+   python src/agent_orchestrator.py invoke "What is the return policy for Premium customers?" CUST-001
+   ```
 
-Use synthetic data only. IAM-authenticated runtime access is not customer authentication: the supplied customer ID must be bound to a verified identity before using real customer data. The starter's observability and session behavior are educational and need a privacy and concurrency review before production. The communication tool now checks for missing required workers before composing a response; model choices outside that check can still vary. Arithmetic is model-generated: an initial hosted invocation rounded incorrectly before the prompt was improved. The AgentCore Memory resource configuration alone does not demonstrate that the application writes and retrieves conversation history. The starter's CDK deployment dependencies had two high and three moderate findings in `npm audit --omit=dev` on November 6, 2026; review updates before reuse. Never commit credentials, `.env`, deployment state, or account-specific runtime configuration.
+For an interactive session, run `python src/agent_orchestrator.py chat` after provisioning AWS resources. When finished, run `python infrastructure/cleanup.py` to preview resource deletion.
+
+## Verification
+
+Run the focused tests from the repository root:
+
+```bash
+python -m unittest discover -s tests -p 'test_return_rules.py'
+python -m unittest discover -s tests -p 'test_refunds.py'
+```
+
+After provisioning, run `python src/agent_orchestrator.py test` for live scenarios and `python tests/test_agent.py all` for the full rubric checks. The scenario suite includes a mock return that changes seeded order state.
+
+The November 6 sandbox run confirmed live retrieval from all three policy knowledge bases and checked four hosted routes using the stored workflow state. A lookup with the wrong customer ID returned “Order not found.”
+
+## Scope and attribution
+
+NovaMart is a submitted Udacity capstone that uses synthetic data. The return tool records a return request and reference in DynamoDB. Payment settlement is outside the demo’s scope. Real customer use would require binding the customer ID to an authenticated identity. Arithmetic is model-generated, and conversation-history recall through AgentCore Memory remains unverified.
+
+Based on Udacity’s Multi-Agent E-commerce RAG starter. See the [original project instructions](UDACITY-STARTER-README.md) and [Udacity license](UDACITY-LICENSE.md).
